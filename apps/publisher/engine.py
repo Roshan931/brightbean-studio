@@ -696,6 +696,10 @@ class PublishEngine:
         # that require fetchable URLs (Instagram, Threads, Google Business, etc.)
         media_files = []
         media_urls = []
+        # Per-item media type, parallel to media_urls. Sniffed from magic bytes
+        # at upload, so providers can route on what the file *is* rather than on
+        # a storage-key extension copied from the client-declared filename.
+        media_types = []
         temp_files = []
         # Owned locally only when the caller didn't hand us a post-level cache
         # (the retry path); ``owns_cache`` decides who cleans it up.
@@ -740,6 +744,7 @@ class PublishEngine:
                     # Local storage: make absolute using APP_URL
                     url = f"{app_url}{url}"
                 media_urls.append(url)
+                media_types.append(asset.media_type)
 
                 if needs_local_media:
                     media_files.append(media_cache.path_for(asset))
@@ -815,6 +820,7 @@ class PublishEngine:
                 first_comment=platform_post.effective_first_comment,
                 media_files=media_files,
                 media_urls=media_urls,
+                media_types=media_types,
                 post_type=post_type,
                 extra=extra,
                 link_url=link_url,
@@ -848,6 +854,28 @@ class PublishEngine:
                 media_cache.cleanup()
 
     @staticmethod
+    def _hint_matches_media(hint: PostType, media_count: int, first_media_type: str | None) -> bool:
+        """Whether the current attachments can still satisfy a media-shaped hint.
+
+        The hint is written when the composer form is submitted, but attachments
+        are added and removed by endpoints that persist on their own (composer
+        remove_media, the media picker), so it can outlive the media it
+        described. Trusting it then routes the post to an endpoint its
+        attachments do not fit: a Reels or video endpoint handed an image, or a
+        video endpoint handed nothing at all.
+
+        Only hints that name a media shape are checked. TEXT, LINK, PIN and the
+        rest say nothing about attachments and are left to their callers.
+        """
+        if hint is PostType.REEL:
+            # Every Reels API takes exactly one video.
+            return media_count == 1 and first_media_type == "video"
+        if hint is PostType.VIDEO:
+            # _publish_video posts media_urls[0] to the video endpoint as-is.
+            return first_media_type == "video"
+        return True
+
+    @staticmethod
     def _resolve_post_type(
         platform: str,
         platform_extra: dict,
@@ -857,18 +885,27 @@ class PublishEngine:
         """Derive the correct PostType from context.
 
         Priority:
-        1. Explicit hint in platform_extra (validated against PostType enum)
+        1. Explicit hint in platform_extra (validated against PostType enum,
+           and against the media actually attached right now)
         2. Platform defaults (Pinterest → PIN)
         3. Multi-media on carousel-capable platforms → CAROUSEL
-        4. Fallback: video → VIDEO, image → IMAGE, else → TEXT
+        4. Fallback: video → VIDEO (REEL on Instagram), image → IMAGE, else → TEXT
         """
         # 1. Explicit post_type hint from platform_extra
         hint = platform_extra.get("post_type")
         if hint:
             valid_values = {pt.value for pt in PostType}
-            if hint in valid_values:
+            if hint not in valid_values:
+                logger.warning("Invalid post_type hint %r, ignoring", hint)
+            elif not PublishEngine._hint_matches_media(PostType(hint), media_count, first_media_type):
+                logger.warning(
+                    "Ignoring stale %s post_type hint: %d attachment(s), first is %r",
+                    hint,
+                    media_count,
+                    first_media_type,
+                )
+            else:
                 return PostType(hint)
-            logger.warning("Invalid post_type hint %r, ignoring", hint)
 
         # 2. Platform defaults
         if platform == "pinterest":
@@ -884,6 +921,13 @@ class PublishEngine:
 
         # 4. Fallback based on first media type
         if first_media_type == "video":
+            # Instagram has no standalone feed video — a lone video is a Reel.
+            # Resolving that here keeps the platform rule next to the other
+            # platform rules above, rather than leaving each Instagram provider
+            # to translate PostType.VIDEO on its own (which instagram_login
+            # failed to do, publishing the .mp4 as image_url).
+            if platform in ("instagram", "instagram_login"):
+                return PostType.REEL
             return PostType.VIDEO
         if first_media_type == "image":
             return PostType.IMAGE
