@@ -314,6 +314,7 @@
               hx-post="{% if post %}{% url 'composer:save_post_edit' workspace_id=workspace.id post_id=post.id %}{% else %}{% url 'composer:save_post' workspace_id=workspace.id %}{% endif %}"
               hx-swap="none"
               @htmx:after-request="onFormSaved($event)"
+              {# onFormSaved renders every failure inline, JSON or not, so the global toast would duplicate it. Element-scoped: nested controls (Clone, template picker) keep theirs. #}
               data-no-error-toast
               class="flex flex-col flex-1 min-h-0">
             <input type="hidden" name="selected_accounts" :value="selectedAccounts.join(',')">
@@ -416,6 +417,20 @@
                             title="Create an editable draft copy">
                         Clone
                     </button>
+                </div>
+                {% endif %}
+
+                {% if live_siblings %}
+                <!-- Scoped away from a channel that already published. The caption
+                     and title below are shared with it, so say so before it gets
+                     edited out from under a live post. -->
+                <div class="border border-amber-200 bg-amber-50 rounded-xl p-3 flex items-start gap-2">
+                    <svg class="w-4 h-4 text-amber-500 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z"/></svg>
+                    <p class="text-xs text-amber-700">
+                        Already published on
+                        <span class="font-semibold">{% for pp in live_siblings %}{{ pp.social_account.account_name|default:pp.social_account.account_handle }}{% if not forloop.last %}, {% endif %}{% endfor %}</span>.
+                        Shared fields like the caption are used by that post too — editing them here changes its record.
+                    </p>
                 </div>
                 {% endif %}
 

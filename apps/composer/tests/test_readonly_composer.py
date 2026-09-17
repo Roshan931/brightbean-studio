@@ -11,6 +11,8 @@ channel, so read-only must reflect *that* child. A failed channel on a
 partially-published post stays fully workable.
 """
 
+import re
+
 from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
@@ -167,6 +169,51 @@ class ActionBarGatingTests(ReadonlyComposerTestsBase):
         self.assertTrue(resp.context["post_is_readonly"])
         self.assertNotIn(PUBLISH_BTN, resp.content.decode("utf-8"))
 
+    def test_scope_naming_an_unrelated_account_stays_readonly(self):
+        # secondary owns no row on this post: the scoped list is empty, which
+        # must fall back to the aggregate rather than reopening a live post.
+        post = self._make_post(PlatformPost.Status.PUBLISHED)
+        resp = self._compose(post, account=self.secondary)
+        self.assertTrue(resp.context["post_is_readonly"])
+        body = resp.content.decode("utf-8")
+        self.assertNotIn(PUBLISH_BTN, body)
+        self.assertNotIn(SAVE_DRAFT_BTN, body)
+
+    def test_uppercased_scope_still_matches_its_child(self):
+        post = self._make_post(PlatformPost.Status.PUBLISHED, PlatformPost.Status.FAILED)
+        url = reverse("composer:compose_edit", kwargs={"workspace_id": self.ws.id, "post_id": post.id})
+        resp = self.client.get(f"{url}?account={str(self.secondary.id).upper()}")
+        # Matched the failed child despite the casing, so the composer stays live.
+        self.assertFalse(resp.context["post_is_readonly"])
+        self.assertIn(PUBLISH_BTN, resp.content.decode("utf-8"))
+
+    def test_scoped_view_names_the_live_sibling(self):
+        post = self._make_post(PlatformPost.Status.PUBLISHED, PlatformPost.Status.FAILED)
+        resp = self._compose(post, account=self.secondary)
+        self.assertFalse(resp.context["post_is_readonly"])
+        self.assertEqual([pp.social_account_id for pp in resp.context["live_siblings"]], [self.primary.id])
+        self.assertIn("Already published on", resp.content.decode("utf-8"))
+
+    def test_unscoped_view_has_no_live_sibling_notice(self):
+        post = self._make_post(PlatformPost.Status.DRAFT, PlatformPost.Status.PUBLISHED)
+        resp = self._compose(post)
+        self.assertEqual(list(resp.context["live_siblings"]), [])
+        self.assertNotIn("Already published on", resp.content.decode("utf-8"))
+
+    def test_only_the_form_itself_opts_out_of_the_error_toast(self):
+        # base.html checks data-no-error-toast on the requesting element, not its
+        # ancestors, so exactly one element may carry it: the form, whose
+        # onFormSaved renders every failure inline. If it ever spreads to a
+        # wrapper, the nested Clone button and template picker — which have no
+        # handler of their own — start failing silently.
+        body = self._compose(self._make_post(PlatformPost.Status.PUBLISHED)).content.decode("utf-8")
+        # Bare attribute uses only — base.html's own handler mentions the name
+        # as a quoted string, which is not an opt-out.
+        attribute_uses = re.findall(r"""(?<!['"])data-no-error-toast(?!['"])""", body)
+        self.assertEqual(len(attribute_uses), 1)
+        form_tag = body[body.index('<form id="composer-form"') :]
+        self.assertIn("data-no-error-toast", form_tag[: form_tag.index(">")])
+
 
 class ReadonlyWriteGuardTests(ReadonlyComposerTestsBase):
     """The endpoints refuse what the action bar stopped offering."""
@@ -271,5 +318,41 @@ class ReadonlyWriteGuardTests(ReadonlyComposerTestsBase):
             ),
         )
         self.assertEqual(resp.status_code, 400)
+        post.refresh_from_db()
+        self.assertEqual(post.caption, "original caption")
+
+    def test_uppercased_scope_cannot_slip_past_the_guard(self):
+        # uuid.UUID() accepts any case, but str() of one is always lowercase —
+        # comparing strings would match no child and fall open.
+        post = self._make_post(PlatformPost.Status.PUBLISHED)
+        resp = self.client.post(
+            self._save_url(post),
+            data=self._payload(action="publish_now", account_scope=str(self.primary.id).upper()),
+        )
+        self.assertEqual(resp.status_code, 400)
+        post.refresh_from_db()
+        self.assertIsNone(post.scheduled_at)
+        self.assertEqual(post.caption, "original caption")
+
+    def test_scope_naming_an_unrelated_account_cannot_slip_past_the_guard(self):
+        # secondary has no PlatformPost on this post, so the scoped child list is
+        # empty. An empty list must not read as "nothing published here".
+        post = self._make_post(PlatformPost.Status.PUBLISHED)
+        resp = self.client.post(
+            self._save_url(post),
+            data=self._payload(action="publish_now", account_scope=str(self.secondary.id)),
+        )
+        self.assertEqual(resp.status_code, 400)
+        post.refresh_from_db()
+        self.assertIsNone(post.scheduled_at)
+        self.assertEqual(post.caption, "original caption")
+
+    def test_autosave_with_unrelated_scope_on_published_post_is_a_no_op(self):
+        post = self._make_post(PlatformPost.Status.PUBLISHED)
+        resp = self.client.post(
+            self._autosave_url(post),
+            data={"title": "Rewritten", "caption": "rewritten caption", "account_scope": str(self.secondary.id)},
+        )
+        self.assertEqual(resp.status_code, 200)
         post.refresh_from_db()
         self.assertEqual(post.caption, "original caption")
