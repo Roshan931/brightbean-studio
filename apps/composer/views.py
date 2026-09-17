@@ -49,13 +49,11 @@ from .models import (
     PostVersion,
     Tag,
 )
-from .status import derive_post_status
+from .status import READONLY_STATUSES, derive_post_status
 
 logger = logging.getLogger(__name__)
 
 MAX_CSV_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB cap on CSV planner imports
-
-READONLY_POST_STATUSES = ("publishing", "partially_published", "published")
 
 # Shown when every posting slot within the lookahead horizon is already taken.
 _QUEUE_FULL_MSG = "No open posting slot within the scheduling horizon — add posting slots or free one up."
@@ -131,6 +129,44 @@ def _scoped_platform_post_ids(request, post):
     if not scope:
         return None
     return list(post.platform_posts.filter(social_account_id=scope).values_list("id", flat=True))
+
+
+def _is_readonly_write(request, post):
+    """Whether every PlatformPost this request would touch has already published.
+
+    Backs the composer's read-only banner on the server: once a post is live (or
+    mid-publish) there is nothing left to write, so the save and autosave paths
+    must stop rewriting its content and re-stamping ``scheduled_at``.
+
+    Scoped requests (``account_scope``) only weigh that one child, mirroring the
+    scoped composer: a failed channel on a partially-published post stays
+    workable, and Clone remains the retry path for the published ones. A post
+    with no children yet (a brand-new draft) is never read-only.
+    """
+    children = list(post.platform_posts.all())
+    scope = _get_account_scope(request)
+    if scope:
+        children = [pp for pp in children if str(pp.social_account_id) == scope]
+    return bool(children) and all(pp.status in PlatformPost.PROTECTED_STATUSES for pp in children)
+
+
+def _readonly_rejection(request, post):
+    """A 400 for a write to an already-published post, or ``None`` to proceed.
+
+    ``{"errors": {...}}`` is the only shape the composer renders as a readable
+    message (see ``onFormSaved`` in compose.html); ``PermissionDenied`` would
+    return Django's HTML 403 and degrade to the generic fallback toast.
+    """
+    if not _is_readonly_write(request, post):
+        return None
+    return JsonResponse(
+        {
+            "errors": {
+                "status": "This post has already published and can't be edited. Use Clone to repost an editable copy."
+            }
+        },
+        status=400,
+    )
 
 
 def _sync_platform_posts(request, post, workspace, initial_status=None):
@@ -502,12 +538,28 @@ def compose(request, workspace_id, post_id=None):
     ws_role = membership.workspace_role if membership else None
     can_view_internal_notes = ws_role not in ("client", "viewer") if ws_role else True
 
+    # "Read-only" describes what the composer is actually *showing*. Opened
+    # scoped to one account (``?account=``) only that child's status counts, so
+    # a failed channel on a partially-published post stays workable; unscoped,
+    # the aggregate decides. Clone is the escape hatch for the published ones.
+    readonly_source = (
+        [pp for pp in platform_post_list if str(pp.social_account_id) == account_filter]
+        if account_filter
+        else platform_post_list
+    )
+    post_is_readonly = (
+        post is not None and derive_post_status([pp.status for pp in readonly_source]) in READONLY_STATUSES
+    )
+
     # Approval workflow context
     workflow_mode = workspace.approval_workflow_mode
-    show_resubmit_button = any(pp.status in ("changes_requested", "rejected", "approved") for pp in platform_post_list)
+    # A read-only post is done with the workflow — neither button applies.
+    show_resubmit_button = not post_is_readonly and any(
+        pp.status in ("changes_requested", "rejected", "approved") for pp in platform_post_list
+    )
     # Fresh drafts get "Submit for Approval"; posts already in the workflow
     # (changes-requested / rejected / approved-but-edited) get "Resubmit" instead.
-    show_submit_button = workflow_mode != "none" and not show_resubmit_button
+    show_submit_button = workflow_mode != "none" and not show_resubmit_button and not post_is_readonly
     # Once the post is committed to publishing, the Schedule Post panel re-times
     # a live schedule; while still a draft it captures a *proposed* time on save.
     # Mirror _capture_proposed_publish_at's guard exactly (scheduled_at OR a
@@ -516,9 +568,6 @@ def compose(request, workspace_id, post_id=None):
     post_is_scheduled = post is not None and (
         post.scheduled_at is not None
         or any(pp.status in ("scheduled", "publishing", "published") for pp in platform_post_list)
-    )
-    post_is_readonly = (
-        post is not None and derive_post_status([pp.status for pp in platform_post_list]) in READONLY_POST_STATUSES
     )
 
     # Approval history and comments for existing posts
@@ -774,6 +823,12 @@ def save_post(request, workspace_id, post_id=None):
         perms = membership.effective_permissions if membership else {}
         if post.author != request.user and not perms.get("edit_others_posts", False):
             raise PermissionDenied("You do not have permission to edit this post.")
+        # Reject before the form binds, so an already-published post is never
+        # mutated in memory. Catches every action, including the ``save_draft``
+        # default a POST with no ``action`` falls back to.
+        readonly_error = _readonly_rejection(request, post)
+        if readonly_error is not None:
+            return readonly_error
         _orig_content = _base_content_snapshot(post)
         form = PostForm(request.POST, instance=post)
     else:
@@ -1131,6 +1186,12 @@ def autosave(request, workspace_id, post_id=None):
         perms = membership.effective_permissions if membership else {}
         if post.author != request.user and not perms.get("edit_others_posts", False):
             raise PermissionDenied("You do not have permission to edit this post.")
+        # A published post is read-only: silently stop saving rather than
+        # overwriting live content every 30 seconds. This returns 200 with the
+        # indicator markup on purpose — the response swaps into #autosave-status,
+        # so a 4xx here would fire the global error toast on every tick.
+        if _is_readonly_write(request, post):
+            return HttpResponse('<span class="text-xs text-gray-400">Read-only — not saved</span>')
         orig_content = _base_content_snapshot(post)
     else:
         # Check if a previous autosave already created a draft for this session

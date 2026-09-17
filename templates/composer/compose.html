@@ -314,6 +314,7 @@
               hx-post="{% if post %}{% url 'composer:save_post_edit' workspace_id=workspace.id post_id=post.id %}{% else %}{% url 'composer:save_post' workspace_id=workspace.id %}{% endif %}"
               hx-swap="none"
               @htmx:after-request="onFormSaved($event)"
+              data-no-error-toast
               class="flex flex-col flex-1 min-h-0">
             <input type="hidden" name="selected_accounts" :value="selectedAccounts.join(',')">
             {% if account_scope %}
@@ -405,7 +406,8 @@
                 {% elif post_is_readonly %}
                 <!-- Published / publishing: read-only; Clone to repost an editable copy -->
                 <div class="border border-stone-200 bg-stone-50 rounded-xl p-3 flex items-start justify-between gap-3">
-                    <div class="flex items-start gap-2">                        <svg class="w-4 h-4 text-stone-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z"/></svg>
+                    <div class="flex items-start gap-2">
+                        <svg class="w-4 h-4 text-stone-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z"/></svg>
                         <p class="text-xs text-stone-600">This post is <span class="font-semibold">{{ post.get_status_display|default:post.status }}</span> and read-only. Use <span class="font-semibold">Clone</span> to repost an editable copy.</p>
                     </div>
                     <button type="button"
@@ -1341,12 +1343,14 @@
                 </div>
                 <div class="mr-auto sm:hidden"></div>
 
+                {% if not post_is_readonly %}
                 <!-- Save Draft -->
                 <button type="submit" name="action" value="save_draft"
                         class="inline-flex items-center gap-1.5 px-2 sm:px-4 py-2 text-sm font-semibold text-stone-600 hover:text-stone-800 rounded-lg hover:bg-stone-100 transition-all duration-150 cursor-pointer flex-shrink-0">
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"/></svg>
                     <span class="hidden sm:inline">Save Draft</span>
                 </button>
+                {% endif %}
 
                 {% if show_submit_button %}
                 <button type="submit" name="action" value="submit_for_approval"
@@ -1372,7 +1376,8 @@
                 {% if not post_is_readonly %}
                 <!-- Publish split-button -->
                 <div class="relative inline-flex flex-shrink-0" id="publish-anchor">
-                    <!-- Mode selector (left) -->                    <button type="button" id="publish-mode-btn"
+                    <!-- Mode selector (left) -->
+                    <button type="button" id="publish-mode-btn"
                             :disabled="selectedAccounts.length === 0"
                             :class="selectedAccounts.length === 0 && 'opacity-50 cursor-not-allowed'"
                             class="inline-flex items-center gap-1.5 pl-2 sm:pl-3 pr-1.5 sm:pr-2 py-2 text-sm font-semibold text-orange-700 bg-orange-100 rounded-l-lg hover:bg-orange-200 border border-orange-200 border-r-0 transition-all duration-150 cursor-pointer">
@@ -1491,6 +1496,7 @@
                 {% endif %}
             </div>
         </form>
+
         {% if post and approval_history %}
         <!-- Approval History & Comments -->
         <div class="mt-4 border-t border-stone-200 pt-4">
@@ -1586,8 +1592,10 @@
         </div>
         {% endif %}
 
+        {% if not post_is_readonly %}
         <!-- Auto-save trigger (every 30 seconds) -->
         <!-- Tracks autosaved post ID to prevent duplicate drafts -->
+        <!-- A read-only post has nothing to save; the endpoint refuses it too. -->
         <input type="hidden" name="_autosave_post_id" :value="autosavedPostId" form="composer-form">
         <div id="autosave-trigger"
              hx-post="{% if post %}{% url 'composer:autosave_edit' workspace_id=workspace.id post_id=post.id %}{% else %}{% url 'composer:autosave' workspace_id=workspace.id %}{% endif %}"
@@ -1596,6 +1604,7 @@
              hx-include="#composer-form"
              hx-swap="innerHTML"
              style="display:none;"></div>
+        {% endif %}
     </div>
 
     <!-- ════════════════════════════════════════════════════════════
